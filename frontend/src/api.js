@@ -41,15 +41,24 @@ export async function planTrip(payload) {
   return res.json()
 }
 
-export async function fetchUserTrips(userId) {
-  if (!API_BASE_URL) return []
-  const url = new URL('/trips', API_BASE_URL)
-  if (userId) url.searchParams.set('userId', userId)
+export async function askQuestion(question, userId) {
+  if (!API_BASE_URL) return { answer: '' }
+  const k = (n) => profileKey(userId, n)
+  let preferences = []
+  let start_city = 'Delhi'
+  try {
+    preferences = normalizePreferences(JSON.parse(localStorage.getItem(k('interests')) || '[]'))
+    start_city = localStorage.getItem(k('start_city')) || 'Delhi'
+  } catch {}
+  const url = new URL('/ask', API_BASE_URL)
   const res = await fetch(url.toString(), {
-    headers: { 'Accept': 'application/json' },
-    credentials: 'include',
+    method: 'POST',
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, preferences, start_city }),
   })
   if (!res.ok) throw new Error(`API error ${res.status}`)
   return res.json()
 }
+
+// trips APIs removed
 

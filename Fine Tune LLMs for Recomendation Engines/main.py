@@ -5,47 +5,61 @@ from pydantic import BaseModel
 import re
 import requests
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from datetime import datetime
 
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaLLM
+from langchain.prompts import PromptTemplate
 
-# === CONFIG ===
+# Config
 OLLAMA_URL = "http://localhost:11434/api/generate"
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 
-# === FASTAPI APP ===
-app = FastAPI(title="Touristique - AI Travel Planner", version="1.0")
+# FastAPI setup
+app = FastAPI(title="Touristique API", version="2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-print("Loading RAG index …")
+print("Loading RAG index...")
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 db = Chroma(persist_directory="chroma_db", embedding_function=embeddings)
 
-# === MODELS ===
+print("Loading Qwen chatbot model...")
+qwen_llm = OllamaLLM(model="qwen2.5:7b-instruct-q4_K_M", temperature=0.3)
+
+print("Trips storage disabled")
+
+# Request models
 class TripRequest(BaseModel):
     preferences: List[str] = []
     duration: int = 2
     budget: float = 15000
     start_city: str = "Delhi"
 
-# === HELPERS ===
+class AskRequest(BaseModel):
+    question: str
+    preferences: List[str] = []
+    chosen_options: Optional[List[dict]] = None
+    selected_option: Optional[dict] = None
+
+# Helper functions
 def get_field(content: str, key: str, default: str = "?") -> str:
     for line in content.split("\n"):
         if line.startswith(f"{key}:"):
             return line.split(":", 1)[1].strip()
     return default
 
-def query_ollama(prompt: str, temperature: float = 0.2) -> str:
+def query_ollama(prompt: str, model: str = "phi3:mini", temperature: float = 0.2) -> str:
     payload = {
-        "model": "phi3:mini",
+        "model": model,
         "prompt": prompt,
         "stream": False,
         "options": {"temperature": temperature, "top_p": 0.9}
@@ -55,7 +69,7 @@ def query_ollama(prompt: str, temperature: float = 0.2) -> str:
         r.raise_for_status()
         return r.json()["response"]
     except Exception as e:
-        print(f"Ollama failed: {e}")
+        print(f"Ollama error: {e}")
         return ""
 
 def query_grok(prompt: str, temperature: float = 0.2) -> str:
@@ -75,7 +89,7 @@ def query_grok(prompt: str, temperature: float = 0.2) -> str:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"Grok API failed: {e}")
+        print(f"Grok API error: {e}")
         return ""
 
 def robust_parse_itinerary(text: str):
@@ -102,10 +116,8 @@ def robust_parse_itinerary(text: str):
     return itinerary, total
 
 def generate_single_itinerary(context: str, req: TripRequest, variation_num: int, temperature: float):
-    """Generate one itinerary variation"""
     max_per_day = req.budget // req.duration
     
-    # Add variation-specific instructions
     variation_hints = [
         "Focus on popular tourist spots and well-known attractions.",
         "Prioritize off-beat, less crowded hidden gems and local experiences.",
@@ -144,10 +156,8 @@ Day 2: Jaipur - Hawa Mahal, City Palace. Stay: Eco Homestay - ₹2,800. Food: Py
 Generate the {req.duration}-day itinerary now:
 """.strip()
 
-    # Try Phi-3 first
-    answer = query_ollama(prompt, temperature)
+    answer = query_ollama(prompt, model="phi3:mini", temperature=temperature)
     
-    # Fallback to Grok
     if not answer.strip() or "error" in answer.lower():
         answer = query_grok(prompt, temperature)
     
@@ -155,9 +165,10 @@ Generate the {req.duration}-day itinerary now:
 
 @app.post("/plan")
 def plan_trip(req: TripRequest):
-    # 1. Retrieve more places to have variety
+    print(f"Planning trip: {req.preferences} | {req.duration} days | Rs.{req.budget:,}")
+    
     query = f"{', '.join(req.preferences)} near {req.start_city}"
-    docs = db.similarity_search(query, k=20)  # Increased from 8 to 20
+    docs = db.similarity_search(query, k=20)
 
     context_lines = []
     for d in docs:
@@ -171,22 +182,18 @@ def plan_trip(req: TripRequest):
 
     context = "\n".join(context_lines) if context_lines else "No places found."
 
-    # 2. Generate 5 different itinerary options
     all_options = []
-    temperatures = [0.3, 0.5, 0.7, 0.6, 0.4]  # Different temperatures for variety
+    temperatures = [0.3, 0.5, 0.7, 0.6, 0.4]
     
     print(f"Generating 5 itinerary options...")
     
     for i in range(5):
-        print(f"Generating option {i+1}/5...")
+        print(f"  Option {i+1}/5 (temp={temperatures[i]})...")
         
         answer = generate_single_itinerary(context, req, i, temperatures[i])
-        print(f"Option {i+1} RAW OUTPUT:\n{answer}\n{'='*60}")
-        
-        # Parse the itinerary
         itinerary, total = robust_parse_itinerary(answer)
         
-        if itinerary and total > 0:  # Only add valid itineraries
+        if itinerary and total > 0:
             all_options.append({
                 "option_number": i + 1,
                 "itinerary": itinerary,
@@ -195,16 +202,16 @@ def plan_trip(req: TripRequest):
                 "raw_output": answer
             })
     
-    # 3. Return all options or error
     if not all_options:
         return {
             "options": [],
-            "error": "Failed to generate any valid itineraries. Check raw outputs.",
+            "error": "Failed to generate any valid itineraries.",
             "retrieved_places": context
         }
     
-    # Sort by total cost (gives users budget-friendly options first)
     all_options.sort(key=lambda x: x["total_cost"])
+    
+    print(f"Generated {len(all_options)} valid options")
     
     return {
         "options": all_options,
@@ -213,7 +220,119 @@ def plan_trip(req: TripRequest):
         "retrieved_places_count": len(docs)
     }
 
-# === HEALTH CHECK ===
+@app.post("/ask")
+def chat(req: AskRequest):
+    print(f"Chat query: {req.question[:50]}...")
+    
+    filt = {}
+    if req.preferences:
+        cats = [p.lower() for p in req.preferences if p.lower() in {"heritage", "food", "nature", "adventure", "spiritual", "beach"}]
+        if cats:
+            filt = {"category": {"$in": cats}}
+    
+    retriever = db.as_retriever(search_kwargs={"k": 5, "filter": filt or None})
+    docs = retriever.invoke(req.question)
+    context = "\n---\n".join([d.page_content for d in docs])
+    
+    options_context = ""
+    if req.chosen_options and len(req.chosen_options) > 0:
+        options_context = "\n\nUSER'S GENERATED ITINERARY OPTIONS:\n"
+        for opt in req.chosen_options[:5]:
+            opt_num = opt.get("option_number", "?")
+            total = opt.get("total_cost", 0)
+            options_context += f"\nOption {opt_num} (Total: ₹{total:,}):\n"
+            for day_info in opt.get("itinerary", []):
+                day = day_info.get("day")
+                city = day_info.get("city")
+                dests = ", ".join(day_info.get("destinations", []))
+                stay = day_info.get("stay", "-")
+                food = day_info.get("food", "-")
+                cost = day_info.get("cost", 0)
+                options_context += f"  Day {day} ({city}): {dests} | Stay: {stay} | Food: {food} | Cost: ₹{cost:,}\n"
+    
+    selected_context = ""
+    if req.selected_option:
+        sel = req.selected_option
+        selected_context = f"""
+
+USER'S SELECTED ITINERARY (Option {sel.get('option_number', '?')}):
+Total Cost: ₹{sel.get('total_cost', 0):,}
+"""
+        for day_info in sel.get("itinerary", []):
+            day = day_info.get("day")
+            city = day_info.get("city")
+            dests = ", ".join(day_info.get("destinations", []))
+            stay = day_info.get("stay", "-")
+            food = day_info.get("food", "-")
+            selected_context += f"\nDay {day} ({city}): {dests}\n  Stay: {stay} | Food: {food}\n"
+    
+    prompt_text = f"""
+You are Bharat Yatri, a knowledgeable Indian travel guide.
+
+{selected_context}
+{options_context}
+
+RELEVANT PLACE INFORMATION (use only these facts):
+{context}
+
+USER PREFERENCES: {", ".join(req.preferences) if req.preferences else "exploring India"}
+
+USER QUESTION: {req.question}
+
+INSTRUCTIONS:
+1. If the user asks about their generated options, compare and explain the differences.
+2. If the user selected an option, provide detailed insights about their chosen itinerary.
+3. Answer in 3-4 sentences maximum. Be conversational and helpful.
+4. If the question is in Hindi, reply in Hindi naturally.
+5. Add one practical tip, eco-friendly suggestion, or local insight.
+6. Never make up facts. Only use the information provided above.
+7. If you don't have information, say so.
+
+Answer:
+""".strip()
+
+    prompt = PromptTemplate.from_template(prompt_text)
+    chain = prompt | qwen_llm
+    
+    try:
+        answer = chain.invoke({}).strip()
+        print(f"Chatbot response generated")
+        return {
+            "answer": answer,
+            "context_used": {
+                "has_options": bool(req.chosen_options),
+                "has_selection": bool(req.selected_option),
+                "preferences": req.preferences
+            }
+        }
+    except Exception as e:
+        print(f"Chatbot error: {e}")
+        return {
+            "answer": "Sorry, I ran into an issue. Please try again.",
+            "error": str(e)
+        }
+
+# Trips endpoints removed (MongoDB disabled)
+# trips endpoints removed
+
 @app.get("/")
 def home():
-    return {"message": "Touristique API is running! POST to /plan"}
+    return {
+        "message": "Touristique API v2.0 - Running",
+        "endpoints": {
+            "/plan": "POST - Generate 5 itinerary options",
+            "/ask": "POST - Context-aware chatbot",
+        },
+        "status": "running"
+    }
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "models": {
+            "planner": "phi3:mini",
+            "chatbot": "qwen2.5:7b-instruct-q4_K_M"
+        },
+        "rag_index": "loaded"
+    }

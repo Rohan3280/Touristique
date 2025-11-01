@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from 'react'
-import { fetchUserTrips } from '../api'
 
 function getAuthUser() {
   try { return JSON.parse(localStorage.getItem('authUser') || 'null') } catch { return null }
@@ -18,14 +17,7 @@ export function UserProfile() {
   const [trips, setTrips] = useState([])
   const [loading, setLoading] = useState(false)
   const [bgUrl, setBgUrl] = useState('')
-  useEffect(() => {
-    if (!userId) return
-    setLoading(true)
-    fetchUserTrips(userId)
-      .then((data) => setTrips(Array.isArray(data) ? data : (data.items || [])))
-      .catch(() => setTrips([]))
-      .finally(() => setLoading(false))
-  }, [userId])
+  useEffect(() => { setTrips([]); setLoading(false) }, [userId])
 
   // Resolve background image with graceful fallback
   useEffect(() => {

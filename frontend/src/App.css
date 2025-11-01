@@ -520,6 +520,79 @@ button:focus-visible {
   flex-direction: column;
 }
 
+.plans-bar {
+  position: absolute;
+  top: 600px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 7;
+  width: min(92vw, 1100px);
+}
+
+@media (min-width: 768px) {
+  .plans-bar { top: 650px; }
+}
+
+.plans-row {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(220px, 1fr);
+  gap: 12px;
+  overflow-x: auto;
+  padding: 6px 8px;
+}
+
+.plan-card {
+  display: grid;
+  gap: 8px;
+  background: rgba(255,255,255,0.7);
+  backdrop-filter: blur(8px);
+  border: 1px solid #ffe6d1;
+  border-radius: 14px;
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(0,0,0,0.08);
+  color: #000000;
+}
+
+.plan-card:hover { box-shadow: 0 10px 24px rgba(0,0,0,0.12); }
+.plan-card.selected { border: 2px solid #ff8c42; }
+
+.plan-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.plan-title { font-weight: 800; }
+.plan-badge { background: transparent; color: #b5561e; border-radius: 0; padding: 0; font-weight: 700; font-size: 0.9rem; box-shadow: none; }
+.plan-meta { display: flex; align-items: center; justify-content: space-between; color: #333; font-weight: 700; }
+
+.plan-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.35);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.plan-modal {
+  width: min(92vw, 920px);
+  max-height: 85vh;
+  background: rgba(255,255,255,0.95);
+  backdrop-filter: blur(8px);
+  border: 1px solid #ffe6d1;
+  border-radius: 16px;
+  box-shadow: 0 16px 40px rgba(0,0,0,0.2);
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.plan-modal-header { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px; padding: 12px 14px; background: linear-gradient(180deg, rgba(255,255,255,0.9) 0%, rgba(255,255,255,0.6) 100%); border-bottom: 1px solid #ffe6d1; }
+.plan-modal-title { font-weight: 800; }
+.plan-modal-meta { color: #444; font-weight: 700; }
+.plan-modal-close { background: transparent; border: none; font-size: 22px; line-height: 1; cursor: pointer; }
+.plan-modal-body { padding: 12px; overflow: auto; }
+
 .itinerary-slab {
   position: absolute;
   top: 800px;
