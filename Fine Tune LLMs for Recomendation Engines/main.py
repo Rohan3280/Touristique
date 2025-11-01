@@ -1,169 +1,176 @@
-import re
-import json
-import requests
+# main.py
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+import re
+import requests
+import os
+from typing import List, Dict, Any
 
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import OllamaLLM
-from langchain.prompts import PromptTemplate
 
-app = FastAPI(title="Bharat Yatri API")
+# === CONFIG ===
+OLLAMA_URL = "http://localhost:11434/api/generate"
+XAI_API_URL = "https://api.x.ai/v1/chat/completions"
+XAI_API_KEY = os.getenv("XAI_API_KEY")  # Set in env: export XAI_API_KEY=your_key
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],   
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# === FASTAPI APP ===
+app = FastAPI(title="Touristique - AI Travel Planner", version="1.0")
 
 print("Loading RAG index …")
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 db = Chroma(persist_directory="chroma_db", embedding_function=embeddings)
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-
-def query_ollama(prompt: str, model: str = "phi3:mini", temp: float = 0.7) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temp}
-    }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()["response"]
-
+# === MODELS ===
 class TripRequest(BaseModel):
     preferences: List[str] = []
     duration: int = 2
     budget: float = 15000
     start_city: str = "Delhi"
 
-def parse_itinerary(text: str):
-    pattern = (
-        r"Day (\d+): (.+?) - (.+?)\. Stay: (.+?) - ₹([\d,]+)\. "
-        r"Food: (.+?) - ₹([\d,]+)\. Cost: ₹([\d,]+)"
-    )
-    matches = re.findall(pattern, text)
+# === HELPERS ===
+def get_field(content: str, key: str, default: str = "?") -> str:
+    for line in content.split("\n"):
+        if line.startswith(f"{key}:"):
+            return line.split(":", 1)[1].strip()
+    return default
+
+def query_ollama(prompt: str) -> str:
+    payload = {
+        "model": "phi3:mini",
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.2, "top_p": 0.9}
+    }
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=120)
+        r.raise_for_status()
+        return r.json()["response"]
+    except Exception as e:
+        print(f"Ollama failed: {e}")
+        return ""
+
+def query_grok(prompt: str) -> str:
+    if not XAI_API_KEY:
+        return ""
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "grok-beta",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2
+    }
+    try:
+        r = requests.post(XAI_API_URL, json=payload, headers=headers, timeout=60)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Grok API failed: {e}")
+        return ""
+
+def robust_parse_itinerary(text: str):
+    # Ultra-flexible regex: handles ₹, Rs., commas, spaces, missing commas
+    pattern = r"Day\s*(\d+):\s*([^-]+?)\s*-\s*(.+?)\.\s*Stay:\s*(.+?)\s*-\s*[₹₹]?[\s]*([\d,]+)\s*\.\s*Food:\s*(.+?)\s*-\s*[₹₹]?[\s]*([\d,]+)\s*\.\s*Cost:\s*[₹₹]?[\s]*([\d,]+)"
+    matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
+
     itinerary = []
     total = 0
     for m in matches:
         day, city, dest, stay, stay_c, food, food_c, day_c = m
-        cost = int(day_c.replace(",", ""))
-        total += cost
-        itinerary.append({
-            "day": int(day),
-            "city": city.strip(),
-            "destinations": [d.strip() for d in dest.split(",")],
-            "stay": f"{stay.strip()} - ₹{stay_c}",
-            "food": f"{food.strip()} - ₹{food_c}",
-            "cost": cost
-        })
+        try:
+            cost = int(day_c.replace(",", "").replace("₹", "").strip())
+            total += cost
+            itinerary.append({
+                "day": int(day),
+                "city": city.strip(),
+                "destinations": [d.strip() for d in dest.split(",") if d.strip()],
+                "stay": f"{stay.strip()} - ₹{stay_c.replace(',', '')}",
+                "food": f"{food.strip()} - ₹{food_c.replace(',', '')}",
+                "cost": cost
+            })
+        except:
+            continue
     return itinerary, total
 
+# === MAIN ENDPOINT ===
 @app.post("/plan")
 def plan_trip(req: TripRequest):
-    query = f"{', '.join(req.preferences)} near {req.start_city} budget {req.budget}"
-    docs = db.similarity_search(query, k=6)
-    context = "\n".join([
-        f"- {d.metadata.get('Place','?')} ({d.metadata.get('City','?')}): "
-        f"{d.metadata.get('Category','?')}, ₹{d.metadata.get('Entry Fee','500')}"
-        for d in docs
-    ])
+    # 1. Retrieve relevant places
+    query = f"{', '.join(req.preferences)} near {req.start_city}"
+    docs = db.similarity_search(query, k=8)
 
+    context_lines = []
+    for d in docs:
+        place = get_field(d.page_content, "Place")
+        city = get_field(d.page_content, "City")
+        category = get_field(d.page_content, "Category")
+        fee = get_field(d.page_content, "Entry Fee", "500")
+        desc = get_field(d.page_content, "Description", "")
+        short_desc = (desc[:70] + "...") if len(desc) > 70 else desc
+        context_lines.append(f"- {place} ({city}): {category}, ₹{fee} — {short_desc}")
+
+    context = "\n".join(context_lines) if context_lines else "No places found."
+
+    # 2. Build bulletproof prompt
+    max_per_day = req.budget // req.duration
     prompt = f"""
-You are Touristique, India's smartest AI travel planner.
+You are Touristique, India's smartest AI travel planner. Follow instructions EXACTLY.
 
-User wants: {', '.join(req.preferences)}
-Duration: {req.duration} days
-Budget: ₹{req.budget:,}
-Start: {req.start_city}
+USER REQUEST:
+- Preferences: {', '.join(req.preferences)}
+- Duration: {req.duration} days
+- Budget: ₹{req.budget:,}
+- Start: {req.start_city}
 
-REAL PLACES:
+AVAILABLE PLACES (USE ONLY THESE):
 {context}
 
-Generate a {req.duration}-day itinerary:
-- Use only places from the list above
-- 1‑2 destinations per day
-- Eco‑friendly stay
-- Local food
-- Stay under budget
+RULES:
+1. Use ONLY places from the list above.
+2. 1–2 destinations per day.
+3. Include eco-friendly stay & local food.
+4. Cost per day ≤ ₹{max_per_day:,}
+5. Output PLAIN TEXT ONLY. No markdown, JSON, or code.
 
-Format exactly:
+OUTPUT FORMAT (COPY EXACTLY):
 Day 1: Jaipur - Amber Fort. Stay: Eco Homestay - ₹2,800. Food: Dal Baati - ₹600. Cost: ₹5,400
+Day 2: Jaipur - Hawa Mahal, City Palace. Stay: Eco Homestay - ₹2,800. Food: Pyaaz Kachori - ₹500. Cost: ₹6,300
+
+Generate the {req.duration}-day itinerary now:
 """.strip()
 
-    answer = query_ollama(prompt, model="phi3:mini", temp=0.7)
+    print("Calling Phi-3 …")
+    answer = query_ollama(prompt)
 
-    try:
-        itinerary, total = parse_itinerary(answer)
+    # === FALLBACK TO GROK IF PHI-3 FAILS ===
+    if not answer.strip() or "error" in answer.lower():
+        print("Phi-3 failed. Trying Grok-4 (xAI)…")
+        answer = query_grok(prompt)
+
+    print("LLM RAW OUTPUT:\n" + answer + "\n" + "="*60)
+
+    # 3. Parse
+    itinerary, total = robust_parse_itinerary(answer)
+
+    if not itinerary:
         return {
-            "itinerary": itinerary,
-            "total_cost": total,
-            "summary": f"{req.duration}-day trip under ₹{req.budget:,}"
+            "itinerary": [],
+            "total_cost": 0,
+            "summary": f"{req.duration}-day trip under ₹{req.budget:,}",
+            "raw_output": answer,
+            "retrieved_places": context,
+            "error": "Failed to parse itinerary. See raw_output."
         }
-    except Exception as e:
-        return {"raw_output": answer, "retrieved_places": context, "error": str(e)}
 
-class AskRequest(BaseModel):
-    question: str
-    preferences: List[str] = []
-    chosen_card: Optional[dict] = None   # from /plan
+    return {
+        "itinerary": itinerary,
+        "total_cost": total,
+        "summary": f"{req.duration}-day trip for ₹{total:,} (under ₹{req.budget:,})"
+    }
 
-qwen_llm = OllamaLLM(model="qwen2.5:7b-instruct-q4_K_M", temperature=0.3)
-
-@app.post("/ask")
-def chat(req: AskRequest):
-    # 1. Build filter
-    filt = {}
-    if req.preferences:
-        cats = [p.lower() for p in req.preferences if p in {"heritage","food","nature","adventure"}]
-        if cats:
-            filt["category"] = {"$in": cats}
-    if req.chosen_card and req.chosen_card.get("city"):
-        filt["city"] = req.chosen_card["city"].lower()
-
-    retriever = db.as_retriever(search_kwargs={"k": 5, "filter": filt or None})
-    docs = retriever.invoke(req.question)
-    context = "\n---\n".join([d.page_content for d in docs])
-
-    card_ctx = ""
-    if req.chosen_card:
-        c = req.chosen_card
-        card_ctx = f"""
-USER'S SELECTED CARD (Day {c.get('day','?')} – {c.get('city','?')}):
-• Destinations: {", ".join(c.get('destinations',[]))}
-• Food: {c.get('food','-')}
-• Stay: {c.get('stay','-')}
-• Cost: ₹{c.get('cost','?')}
-Answer **with reference to this card**.
-""".strip()
-
-
-    prompt_text = f"""
-You are **Bharat Yatri**, a warm Indian travel companion.
-
-{card_ctx}
-
-Relevant facts (use ONLY these):
-{context}
-
-User likes: {", ".join(req.preferences) if req.preferences else "exploring India"}
-
-Question: {req.question}
-
-• Answer in 2–3 sentences.
-• If question is in Hindi, reply in Hindi.
-• Add one practical or eco tip.
-• NEVER hallucinate.
-""".strip()
-
-    prompt = PromptTemplate.from_template(prompt_text)
-    chain = prompt | qwen_llm
-    answer = chain.invoke({}).strip()
-    return {"answer": answer}
+# === HEALTH CHECK ===
+@app.get("/")
+def home():
+    return {"message": "Touristique API is running! POST to /plan"}
