@@ -1,5 +1,6 @@
 # main.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import re
 import requests
@@ -12,10 +13,17 @@ from langchain_huggingface import HuggingFaceEmbeddings
 # === CONFIG ===
 OLLAMA_URL = "http://localhost:11434/api/generate"
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
-XAI_API_KEY = os.getenv("XAI_API_KEY")  # Set in env: export XAI_API_KEY=your_key
+XAI_API_KEY = os.getenv("XAI_API_KEY")
 
 # === FASTAPI APP ===
 app = FastAPI(title="Touristique - AI Travel Planner", version="1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 print("Loading RAG index …")
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -35,12 +43,12 @@ def get_field(content: str, key: str, default: str = "?") -> str:
             return line.split(":", 1)[1].strip()
     return default
 
-def query_ollama(prompt: str) -> str:
+def query_ollama(prompt: str, temperature: float = 0.2) -> str:
     payload = {
         "model": "phi3:mini",
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2, "top_p": 0.9}
+        "options": {"temperature": temperature, "top_p": 0.9}
     }
     try:
         r = requests.post(OLLAMA_URL, json=payload, timeout=120)
@@ -50,7 +58,7 @@ def query_ollama(prompt: str) -> str:
         print(f"Ollama failed: {e}")
         return ""
 
-def query_grok(prompt: str) -> str:
+def query_grok(prompt: str, temperature: float = 0.2) -> str:
     if not XAI_API_KEY:
         return ""
     headers = {
@@ -60,7 +68,7 @@ def query_grok(prompt: str) -> str:
     payload = {
         "model": "grok-beta",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2
+        "temperature": temperature
     }
     try:
         r = requests.post(XAI_API_URL, json=payload, headers=headers, timeout=60)
@@ -71,7 +79,6 @@ def query_grok(prompt: str) -> str:
         return ""
 
 def robust_parse_itinerary(text: str):
-    # Ultra-flexible regex: handles ₹, Rs., commas, spaces, missing commas
     pattern = r"Day\s*(\d+):\s*([^-]+?)\s*-\s*(.+?)\.\s*Stay:\s*(.+?)\s*-\s*[₹₹]?[\s]*([\d,]+)\s*\.\s*Food:\s*(.+?)\s*-\s*[₹₹]?[\s]*([\d,]+)\s*\.\s*Cost:\s*[₹₹]?[\s]*([\d,]+)"
     matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
 
@@ -94,12 +101,63 @@ def robust_parse_itinerary(text: str):
             continue
     return itinerary, total
 
-# === MAIN ENDPOINT ===
+def generate_single_itinerary(context: str, req: TripRequest, variation_num: int, temperature: float):
+    """Generate one itinerary variation"""
+    max_per_day = req.budget // req.duration
+    
+    # Add variation-specific instructions
+    variation_hints = [
+        "Focus on popular tourist spots and well-known attractions.",
+        "Prioritize off-beat, less crowded hidden gems and local experiences.",
+        "Balance between famous landmarks and local cultural experiences.",
+        "Emphasize adventure activities and outdoor experiences.",
+        "Focus on heritage sites, museums, and historical places."
+    ]
+    
+    hint = variation_hints[variation_num % len(variation_hints)]
+    
+    prompt = f"""
+You are Touristique, India's smartest AI travel planner. Follow instructions EXACTLY.
+
+USER REQUEST:
+- Preferences: {', '.join(req.preferences)}
+- Duration: {req.duration} days
+- Budget: ₹{req.budget:,}
+- Start: {req.start_city}
+- Style: {hint}
+
+AVAILABLE PLACES (USE ONLY THESE):
+{context}
+
+RULES:
+1. Use ONLY places from the list above.
+2. 1–2 destinations per day.
+3. Include eco-friendly stay & local food.
+4. Cost per day ≤ ₹{max_per_day:,}
+5. Create a UNIQUE itinerary different from typical tourist routes.
+6. Output PLAIN TEXT ONLY. No markdown, JSON, or code.
+
+OUTPUT FORMAT (COPY EXACTLY):
+Day 1: Jaipur - Amber Fort. Stay: Eco Homestay - ₹2,800. Food: Dal Baati - ₹600. Cost: ₹5,400
+Day 2: Jaipur - Hawa Mahal, City Palace. Stay: Eco Homestay - ₹2,800. Food: Pyaaz Kachori - ₹500. Cost: ₹6,300
+
+Generate the {req.duration}-day itinerary now:
+""".strip()
+
+    # Try Phi-3 first
+    answer = query_ollama(prompt, temperature)
+    
+    # Fallback to Grok
+    if not answer.strip() or "error" in answer.lower():
+        answer = query_grok(prompt, temperature)
+    
+    return answer
+
 @app.post("/plan")
 def plan_trip(req: TripRequest):
-    # 1. Retrieve relevant places
+    # 1. Retrieve more places to have variety
     query = f"{', '.join(req.preferences)} near {req.start_city}"
-    docs = db.similarity_search(query, k=8)
+    docs = db.similarity_search(query, k=20)  # Increased from 8 to 20
 
     context_lines = []
     for d in docs:
@@ -113,61 +171,46 @@ def plan_trip(req: TripRequest):
 
     context = "\n".join(context_lines) if context_lines else "No places found."
 
-    # 2. Build bulletproof prompt
-    max_per_day = req.budget // req.duration
-    prompt = f"""
-You are Touristique, India's smartest AI travel planner. Follow instructions EXACTLY.
-
-USER REQUEST:
-- Preferences: {', '.join(req.preferences)}
-- Duration: {req.duration} days
-- Budget: ₹{req.budget:,}
-- Start: {req.start_city}
-
-AVAILABLE PLACES (USE ONLY THESE):
-{context}
-
-RULES:
-1. Use ONLY places from the list above.
-2. 1–2 destinations per day.
-3. Include eco-friendly stay & local food.
-4. Cost per day ≤ ₹{max_per_day:,}
-5. Output PLAIN TEXT ONLY. No markdown, JSON, or code.
-
-OUTPUT FORMAT (COPY EXACTLY):
-Day 1: Jaipur - Amber Fort. Stay: Eco Homestay - ₹2,800. Food: Dal Baati - ₹600. Cost: ₹5,400
-Day 2: Jaipur - Hawa Mahal, City Palace. Stay: Eco Homestay - ₹2,800. Food: Pyaaz Kachori - ₹500. Cost: ₹6,300
-
-Generate the {req.duration}-day itinerary now:
-""".strip()
-
-    print("Calling Phi-3 …")
-    answer = query_ollama(prompt)
-
-    # === FALLBACK TO GROK IF PHI-3 FAILS ===
-    if not answer.strip() or "error" in answer.lower():
-        print("Phi-3 failed. Trying Grok-4 (xAI)…")
-        answer = query_grok(prompt)
-
-    print("LLM RAW OUTPUT:\n" + answer + "\n" + "="*60)
-
-    # 3. Parse
-    itinerary, total = robust_parse_itinerary(answer)
-
-    if not itinerary:
+    # 2. Generate 5 different itinerary options
+    all_options = []
+    temperatures = [0.3, 0.5, 0.7, 0.6, 0.4]  # Different temperatures for variety
+    
+    print(f"Generating 5 itinerary options...")
+    
+    for i in range(5):
+        print(f"Generating option {i+1}/5...")
+        
+        answer = generate_single_itinerary(context, req, i, temperatures[i])
+        print(f"Option {i+1} RAW OUTPUT:\n{answer}\n{'='*60}")
+        
+        # Parse the itinerary
+        itinerary, total = robust_parse_itinerary(answer)
+        
+        if itinerary and total > 0:  # Only add valid itineraries
+            all_options.append({
+                "option_number": i + 1,
+                "itinerary": itinerary,
+                "total_cost": total,
+                "summary": f"{req.duration}-day trip for ₹{total:,}",
+                "raw_output": answer
+            })
+    
+    # 3. Return all options or error
+    if not all_options:
         return {
-            "itinerary": [],
-            "total_cost": 0,
-            "summary": f"{req.duration}-day trip under ₹{req.budget:,}",
-            "raw_output": answer,
-            "retrieved_places": context,
-            "error": "Failed to parse itinerary. See raw_output."
+            "options": [],
+            "error": "Failed to generate any valid itineraries. Check raw outputs.",
+            "retrieved_places": context
         }
-
+    
+    # Sort by total cost (gives users budget-friendly options first)
+    all_options.sort(key=lambda x: x["total_cost"])
+    
     return {
-        "itinerary": itinerary,
-        "total_cost": total,
-        "summary": f"{req.duration}-day trip for ₹{total:,} (under ₹{req.budget:,})"
+        "options": all_options,
+        "count": len(all_options),
+        "budget_limit": req.budget,
+        "retrieved_places_count": len(docs)
     }
 
 # === HEALTH CHECK ===

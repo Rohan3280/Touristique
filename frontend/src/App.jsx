@@ -2,14 +2,13 @@ import './App.css'
 import homeImg from './pics/home.jpg'
 import { useEffect, useState } from 'react'
 import { ProfileSetup } from './pages/ProfileSetup'
-import { Recommendations } from './pages/Recommendations'
 import { MapPage } from './pages/MapPage'
 import { CulturalInsights } from './pages/CulturalInsights'
 import { Login } from './pages/Login'
 import { Signup } from './pages/Signup'
 import { UserProfile } from './pages/UserProfile'
 import { useMemo } from 'react'
-import { fetchPersonalizedCards } from './api'
+import { buildPlanRequestFromProfile, planTrip } from './api'
 import { PersonalizedCards } from './components/PersonalizedCards'
 import { signOut } from './auth'
 import t1 from './pics/t1.jpg'
@@ -49,43 +48,108 @@ function App() {
     return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
 
-  // After login, send existing users to recommendations, new users to profile setup
+  // Default page when logged in should always be home
   useEffect(() => {
     if (!authUser) return
-    const userId = authUser.id
-    const hasInterests = (() => {
-      try {
-        const raw = localStorage.getItem(`profile:${userId}:interests`)
-        if (!raw) return false
-        const arr = JSON.parse(raw)
-        return Array.isArray(arr) && arr.length > 0
-      } catch { return false }
-    })()
-    window.location.hash = hasInterests ? '#/recommendations' : '#/profile-setup'
+    window.location.hash = '#/'
   }, [authUser])
 
   const [isChatOpen, setIsChatOpen] = useState(false)
   const [isUserMenuOpen, setIsUserMenuOpen] = useState(false)
   const [cards, setCards] = useState([])
   const [cardsLoading, setCardsLoading] = useState(false)
+  const [totalCost, setTotalCost] = useState(0)
+  const [plans, setPlans] = useState([])
+  const [selectedPlanIdx, setSelectedPlanIdx] = useState(0)
 
   const userId = useMemo(() => authUser?.id || null, [authUser])
   useEffect(() => {
     if (!userId) { setCards([]); return }
-    // Fetch personalized cards when user present and on home
-    setCardsLoading(true)
-    fetchPersonalizedCards(userId)
-      .then((data) => setCards(Array.isArray(data) ? data : (data.items || [])))
-      .catch(() => setCards([]))
-      .finally(() => setCardsLoading(false))
+    const fetchItinerary = async () => {
+      setCardsLoading(true)
+      try {
+        const payload = buildPlanRequestFromProfile(userId)
+        const data = await planTrip(payload)
+        const toDayItems = (arr) => (Array.isArray(arr) ? arr.map((d) => ({
+          day: d.day,
+          place: (Array.isArray(d.destinations) && d.destinations.length ? d.destinations[0] : (d.city || '')),
+          cost: Number(d.cost) || 0,
+        })) : [])
+        if (Array.isArray(data?.itineraries) && data.itineraries.length) {
+          const built = data.itineraries.map((it) => {
+            const days = toDayItems(it.itinerary || it.days || [])
+            const start = days.length ? (days[0].place || '') : ''
+            const end = days.length ? (days[days.length - 1].place || '') : ''
+            const total = Number(it.total_cost || 0)
+            return { days, start, end, total }
+          })
+          setPlans(built)
+          setSelectedPlanIdx(0)
+          const first = built[0] || { days: [], total: 0 }
+          setCards(first.days)
+          setTotalCost(first.total || 0)
+        } else {
+          const items = toDayItems(data?.itinerary)
+          const total = Number(data?.total_cost) || 0
+          setPlans([{ days: items, start: items[0]?.place || '', end: items[items.length-1]?.place || '', total }])
+          setSelectedPlanIdx(0)
+          setCards(items)
+          setTotalCost(total)
+        }
+      } catch {
+        setCards([])
+      } finally {
+        setCardsLoading(false)
+      }
+    }
+    fetchItinerary()
+  }, [userId])
+
+  useEffect(() => {
+    const onProfileUpdated = () => {
+      if (!userId) return
+      const payload = buildPlanRequestFromProfile(userId)
+      setCardsLoading(true)
+      planTrip(payload)
+        .then((data) => {
+          const toDayItems = (arr) => (Array.isArray(arr) ? arr.map((d) => ({
+            day: d.day,
+            place: (Array.isArray(d.destinations) && d.destinations.length ? d.destinations[0] : (d.city || '')),
+            cost: Number(d.cost) || 0,
+          })) : [])
+          if (Array.isArray(data?.itineraries) && data.itineraries.length) {
+            const built = data.itineraries.map((it) => {
+              const days = toDayItems(it.itinerary || it.days || [])
+              const start = days.length ? (days[0].place || '') : ''
+              const end = days.length ? (days[days.length - 1].place || '') : ''
+              const total = Number(it.total_cost || 0)
+              return { days, start, end, total }
+            })
+            setPlans(built)
+            setSelectedPlanIdx(0)
+            const first = built[0] || { days: [], total: 0 }
+            setCards(first.days)
+            setTotalCost(first.total || 0)
+          } else {
+            const items = toDayItems(data?.itinerary)
+            const total = Number(data?.total_cost) || 0
+            setPlans([{ days: items, start: items[0]?.place || '', end: items[items.length-1]?.place || '', total }])
+            setSelectedPlanIdx(0)
+            setCards(items)
+            setTotalCost(total)
+          }
+        })
+        .catch(() => setCards([]))
+        .finally(() => setCardsLoading(false))
+    }
+    window.addEventListener('profile:updated', onProfileUpdated)
+    return () => window.removeEventListener('profile:updated', onProfileUpdated)
   }, [userId])
 
   const renderRoute = () => {
     switch (route) {
       case '#/profile-setup':
         return <ProfileSetup />
-      case '#/recommendations':
-        return <Recommendations />
       case '#/map':
         return <MapPage />
       case '#/chat':
@@ -136,11 +200,11 @@ function App() {
                 <p>{subheading}</p>
                 <div className="cta-group">
                   {authUser ? (
-                    <a className="btn btn-primary" href="#/recommendations">Find your next ship!</a>
+                    <a className="btn btn-primary" href="#/profile-setup">Find your next ship!</a>
                   ) : (
                     <>
                       <a className="btn btn-primary" href="#/signup">{primaryCta}</a>
-                      <a className="btn btn-ghost" href="#/recommendations">{secondaryCta}</a>
+                      <a className="btn btn-ghost" href="#/profile-setup">Find your next ship!</a>
                     </>
                   )}
                 </div>
@@ -163,12 +227,36 @@ function App() {
               </div>
             </div>
             {authUser && (
-              <div className="page-shell" style={{ marginTop: '1rem' }}>
-                {cardsLoading ? (
-                  <p>Loading your recommendations…</p>
-                ) : (
-                  <PersonalizedCards items={cards} />
-                )}
+              <div className="itinerary-slab" id="itinerary-slab">
+                <div className="slab-header">
+                  <div className="slab-title">Itinerary</div>
+                  <div className="slab-stats">
+                    <div className="stat"><span className="label">Days</span><span className="value">{cards.length || 0}</span></div>
+                    <div className="stat"><span className="label">Total</span><span className="value">₹{Number(totalCost).toLocaleString('en-IN')}</span></div>
+                  </div>
+                </div>
+                <div className="slab-body">
+                  {plans.length > 1 && (
+                    <div className="card-grid" style={{ marginBottom: '0.75rem' }}>
+                      {plans.map((p, i) => (
+                        <div key={i} className="rec-card" style={{ cursor: 'pointer', border: i === selectedPlanIdx ? '2px solid #ff8c42' : undefined }} onClick={() => { setSelectedPlanIdx(i); setCards(p.days); setTotalCost(p.total || 0) }}>
+                          <div className="rec-body">
+                            <h3 style={{ marginBottom: '0.25rem' }}>{p.start || 'Start'} → {p.end || 'End'}</h3>
+                            <div className="row" style={{ justifyContent: 'space-between' }}>
+                              <span>Plan {i + 1}</span>
+                              <span>₹{Number(p.total || 0).toLocaleString('en-IN')}</span>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {cardsLoading ? (
+                    <p>Loading…</p>
+                  ) : (
+                    <PersonalizedCards items={cards} />
+                  )}
+                </div>
               </div>
             )}
           </>

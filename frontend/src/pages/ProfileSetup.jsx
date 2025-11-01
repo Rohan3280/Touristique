@@ -56,6 +56,10 @@ export function ProfileSetup() {
     const n = Number(localStorage.getItem(key('travelers')) || 1)
     return Number.isFinite(n) && n > 0 ? n : 1
   })
+  const [startCity, setStartCity] = useState(() => {
+    const s = localStorage.getItem(key('start_city')) || 'Delhi'
+    return s
+  })
 
   useEffect(() => {
     localStorage.setItem(key('interests'), JSON.stringify(selectedInterests))
@@ -69,6 +73,9 @@ export function ProfileSetup() {
   useEffect(() => {
     localStorage.setItem(key('travelers'), String(travelers))
   }, [travelers])
+  useEffect(() => {
+    localStorage.setItem(key('start_city'), startCity || 'Delhi')
+  }, [startCity])
 
   const toggleInterest = (label) => {
     setSelectedInterests((prev) => prev.includes(label) ? prev.filter(i => i !== label) : [...prev, label])
@@ -115,6 +122,11 @@ export function ProfileSetup() {
           </div>
         </div>
 
+        <div className="field">
+          <label>Start city</label>
+          <input className="input" style={{ maxWidth: '240px' }} type="text" placeholder="Delhi" value={startCity} onChange={(e)=>setStartCity(e.target.value)} />
+        </div>
+
         <label>
           Travelers
           <div className="row">
@@ -129,7 +141,7 @@ export function ProfileSetup() {
             href={canGenerate ? '#/' : '#/profile-setup'}
             className="btn btn-primary"
             aria-disabled={!canGenerate}
-            onClick={(e) => { if (!canGenerate) e.preventDefault() }}
+            onClick={(e) => { if (!canGenerate) { e.preventDefault(); return } window.dispatchEvent(new CustomEvent('profile:updated')) }}
           >
             Generate plan
           </a>
